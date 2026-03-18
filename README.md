@@ -43,6 +43,7 @@ MCP_SERVER_PORT=8000
 | `JOBBER_CLIENT_SECRET` | Jobber OAuth app client secret | *required* |
 | `MCP_SERVER_URL` | Public URL of this server (used for OAuth callbacks and metadata) | `http://localhost:8000` |
 | `MCP_SERVER_PORT` | Port to listen on | `8000` |
+| `JOBBER_SHARED_AUTH` | Share one Jobber login across all users (`true`/`false`) | `false` |
 
 Set your Jobber app's redirect URI to `{MCP_SERVER_URL}/jobber/callback`.
 

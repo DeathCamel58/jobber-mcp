@@ -56,6 +56,13 @@ class TokenStore:
                 expires_at INTEGER
             );
 
+            CREATE TABLE IF NOT EXISTS shared_jobber_tokens (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                jobber_access_token TEXT NOT NULL,
+                jobber_refresh_token TEXT,
+                expires_at INTEGER
+            );
+
             CREATE TABLE IF NOT EXISTS pending_auth (
                 state_key TEXT PRIMARY KEY,
                 client_id TEXT NOT NULL,
@@ -317,6 +324,35 @@ class TokenStore:
             (mcp_access_token,),
         )
         await self.db.commit()
+
+    # --- Shared Jobber Tokens (single-tenant mode) ---
+
+    async def save_shared_jobber_tokens(
+        self,
+        jobber_access_token: str,
+        jobber_refresh_token: str | None,
+        expires_at: int | None,
+    ) -> None:
+        await self.db.execute(
+            """INSERT OR REPLACE INTO shared_jobber_tokens
+               (id, jobber_access_token, jobber_refresh_token, expires_at)
+               VALUES (1, ?, ?, ?)""",
+            (jobber_access_token, jobber_refresh_token, expires_at),
+        )
+        await self.db.commit()
+
+    async def get_shared_jobber_tokens(self) -> dict | None:
+        rows = await self.db.execute_fetchall(
+            "SELECT * FROM shared_jobber_tokens WHERE id = 1",
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        return {
+            "jobber_access_token": row[1],
+            "jobber_refresh_token": row[2],
+            "expires_at": row[3],
+        }
 
     # --- Helpers ---
 

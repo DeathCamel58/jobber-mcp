@@ -1,6 +1,7 @@
 """GraphQL client for the Jobber API."""
 
 import logging
+import os
 
 import httpx
 
@@ -18,6 +19,16 @@ class JobberClient:
     def __init__(self, token_store: TokenStore, http_client: httpx.AsyncClient) -> None:
         self.token_store = token_store
         self.http_client = http_client
+        self.shared_auth = os.environ.get("JOBBER_SHARED_AUTH", "").lower() in ("1", "true", "yes")
+
+    async def _get_jobber_tokens(self, mcp_access_token: str) -> dict | None:
+        """Get Jobber tokens, falling back to shared tokens if enabled."""
+        jobber_data = await self.token_store.get_jobber_tokens(mcp_access_token)
+        if jobber_data:
+            return jobber_data
+        if self.shared_auth:
+            return await self.token_store.get_shared_jobber_tokens()
+        return None
 
     async def execute_query(
         self,
@@ -30,7 +41,7 @@ class JobberClient:
         Looks up the user's Jobber token from the MCP access token,
         then executes the query.
         """
-        jobber_data = await self.token_store.get_jobber_tokens(mcp_access_token)
+        jobber_data = await self._get_jobber_tokens(mcp_access_token)
         if not jobber_data:
             return {"errors": [{"message": "No Jobber tokens found. Please re-authenticate."}]}
 

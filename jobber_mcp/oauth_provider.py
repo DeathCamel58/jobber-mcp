@@ -35,6 +35,7 @@ class JobberOAuthProvider:
         self.jobber_client_id = os.environ["JOBBER_CLIENT_ID"]
         self.jobber_client_secret = os.environ["JOBBER_CLIENT_SECRET"]
         self.server_url = os.environ.get("MCP_SERVER_URL", "http://localhost:8000")
+        self.shared_auth = os.environ.get("JOBBER_SHARED_AUTH", "").lower() in ("1", "true", "yes")
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
         data = await self.token_store.get_client(client_id)
@@ -51,7 +52,6 @@ class JobberOAuthProvider:
     async def authorize(
         self, client: OAuthClientInformationFull, params: AuthorizationParams
     ) -> str:
-        # Generate a state key that links the Jobber OAuth callback back to this auth request
         state_key = TokenStore.generate_token()
 
         await self.token_store.save_pending_auth(
@@ -65,6 +65,12 @@ class JobberOAuthProvider:
             resource=str(params.resource) if params.resource else None,
         )
 
+        # In shared mode, if we already have shared Jobber tokens, skip Jobber OAuth
+        if self.shared_auth:
+            shared = await self.token_store.get_shared_jobber_tokens()
+            if shared:
+                return await self._issue_mcp_code_from_shared(state_key, shared)
+
         # Redirect user to Jobber's OAuth authorization page
         jobber_params = {
             "client_id": self.jobber_client_id,
@@ -73,6 +79,43 @@ class JobberOAuthProvider:
             "state": state_key,
         }
         return f"{JOBBER_AUTHORIZE_URL}?{urlencode(jobber_params)}"
+
+    async def _issue_mcp_code_from_shared(self, state_key: str, shared: dict) -> str:
+        """Issue an MCP auth code using shared Jobber tokens (no Jobber redirect)."""
+        pending = await self.token_store.get_pending_auth(state_key)
+        assert pending is not None
+
+        mcp_code = TokenStore.generate_token()
+        expires_at = time.time() + 300
+
+        await self.token_store.save_authorization_code(
+            code=mcp_code,
+            client_id=pending["client_id"],
+            scopes=pending["scopes"],
+            expires_at=expires_at,
+            code_challenge=pending["code_challenge"],
+            redirect_uri=pending["redirect_uri"],
+            redirect_uri_provided_explicitly=pending["redirect_uri_provided_explicitly"],
+            resource=pending["resource"],
+        )
+
+        # Store Jobber tokens under the auth code key (will be re-keyed during exchange)
+        await self.token_store.save_jobber_tokens(
+            mcp_access_token=f"authcode:{mcp_code}",
+            jobber_access_token=shared["jobber_access_token"],
+            jobber_refresh_token=shared["jobber_refresh_token"],
+            expires_at=shared["expires_at"],
+        )
+
+        await self.token_store.delete_pending_auth(state_key)
+
+        params = {"code": mcp_code}
+        if pending["mcp_state"]:
+            params["state"] = pending["mcp_state"]
+
+        redirect_uri = pending["redirect_uri"]
+        separator = "&" if "?" in redirect_uri else "?"
+        return f"{redirect_uri}{separator}{urlencode(params)}"
 
     async def handle_jobber_callback(
         self, jobber_code: str, state_key: str
@@ -102,9 +145,18 @@ class JobberOAuthProvider:
 
         jobber_tokens = token_resp.json()
 
+        # In shared mode, save as shared tokens for all future users
+        if self.shared_auth:
+            await self.token_store.save_shared_jobber_tokens(
+                jobber_access_token=jobber_tokens["access_token"],
+                jobber_refresh_token=jobber_tokens.get("refresh_token"),
+                expires_at=int(time.time()) + jobber_tokens.get("expires_in", 3600),
+            )
+            logger.info("Shared Jobber tokens saved")
+
         # Generate an MCP authorization code
         mcp_code = TokenStore.generate_token()
-        expires_at = time.time() + 300  # 5 minute expiry
+        expires_at = time.time() + 300
 
         await self.token_store.save_authorization_code(
             code=mcp_code,
@@ -118,7 +170,6 @@ class JobberOAuthProvider:
         )
 
         # Store the Jobber tokens, keyed by the MCP auth code temporarily.
-        # They'll be re-keyed to the MCP access token during exchange.
         await self.token_store.save_jobber_tokens(
             mcp_access_token=f"authcode:{mcp_code}",
             jobber_access_token=jobber_tokens["access_token"],
@@ -229,20 +280,28 @@ class JobberOAuthProvider:
         refresh_token: RefreshToken,
         scopes: list[str],
     ) -> OAuthToken:
-        # Find the current MCP access token linked to this refresh token's client
-        # We need the Jobber refresh token to get new Jobber tokens
-        # Look up Jobber tokens by finding the access token for this client
+        # Find the Jobber refresh token to use
         old_access_rows = await self.token_store.db.execute_fetchall(
             "SELECT token FROM access_tokens WHERE client_id = ? ORDER BY expires_at DESC LIMIT 1",
             (client.client_id,),
         )
-        if not old_access_rows:
-            raise TokenError(error="invalid_grant", error_description="No access token found")
 
-        old_mcp_access = old_access_rows[0][0]
-        jobber_data = await self.token_store.get_jobber_tokens(old_mcp_access)
+        jobber_refresh = None
+        old_mcp_access = None
 
-        if not jobber_data or not jobber_data["jobber_refresh_token"]:
+        if old_access_rows:
+            old_mcp_access = old_access_rows[0][0]
+            jobber_data = await self.token_store.get_jobber_tokens(old_mcp_access)
+            if jobber_data:
+                jobber_refresh = jobber_data.get("jobber_refresh_token")
+
+        # In shared mode, fall back to shared tokens for refresh
+        if not jobber_refresh and self.shared_auth:
+            shared = await self.token_store.get_shared_jobber_tokens()
+            if shared:
+                jobber_refresh = shared.get("jobber_refresh_token")
+
+        if not jobber_refresh:
             raise TokenError(
                 error="invalid_grant", error_description="No Jobber refresh token available"
             )
@@ -252,7 +311,7 @@ class JobberOAuthProvider:
             JOBBER_TOKEN_URL,
             data={
                 "grant_type": "refresh_token",
-                "refresh_token": jobber_data["jobber_refresh_token"],
+                "refresh_token": jobber_refresh,
                 "client_id": self.jobber_client_id,
                 "client_secret": self.jobber_client_secret,
             },
@@ -264,12 +323,20 @@ class JobberOAuthProvider:
             )
 
         new_jobber = token_resp.json()
+        now = int(time.time())
+
+        # In shared mode, update shared tokens too
+        if self.shared_auth:
+            await self.token_store.save_shared_jobber_tokens(
+                jobber_access_token=new_jobber["access_token"],
+                jobber_refresh_token=new_jobber.get("refresh_token"),
+                expires_at=now + new_jobber.get("expires_in", 3600),
+            )
 
         # Generate new MCP tokens
         new_mcp_access = TokenStore.generate_token()
         new_mcp_refresh = TokenStore.generate_token()
         expires_in = 3600
-        now = int(time.time())
 
         effective_scopes = scopes or refresh_token.scopes
 
@@ -286,7 +353,7 @@ class JobberOAuthProvider:
             scopes=effective_scopes,
         )
 
-        # Store new Jobber tokens
+        # Store new Jobber tokens for this user
         await self.token_store.save_jobber_tokens(
             mcp_access_token=new_mcp_access,
             jobber_access_token=new_jobber["access_token"],
@@ -295,8 +362,9 @@ class JobberOAuthProvider:
         )
 
         # Clean up old tokens
-        await self.token_store.delete_jobber_tokens(old_mcp_access)
-        await self.token_store.delete_access_token(old_mcp_access)
+        if old_mcp_access:
+            await self.token_store.delete_jobber_tokens(old_mcp_access)
+            await self.token_store.delete_access_token(old_mcp_access)
         await self.token_store.delete_refresh_token(refresh_token.token)
 
         return OAuthToken(
