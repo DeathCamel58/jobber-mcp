@@ -120,7 +120,7 @@ def create_app() -> Starlette:
 def main() -> None:
     port = int(os.environ.get("MCP_SERVER_PORT", "8000"))
     app = create_app()
-    uvicorn.run(app, host="127.0.0.1", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=port)
 
 
 if __name__ == "__main__":
